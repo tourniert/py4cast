@@ -24,6 +24,7 @@ from py4cast.datasets.base import (
     TorchDataloaderSettings,
     collate_fn,
 )
+from py4cast.forcingutils import generate_toa_radiation_forcing, get_year_hour_forcing
 from py4cast.plots import DomainInfo
 from py4cast.settings import CACHE_DIR
 from py4cast.utils import merge_dicts
@@ -39,20 +40,22 @@ DATA_SHAPE = (600, 600, 45, 16)
 SECONDS_IN_YEAR = 365 * 24 * 60 * 60
 
 
-def poesy_forecast_namer(date: dt.datetime, shortname, **kwargs):
+def poesy_forecast_namer(date: dt.datetime, var_file_name, **kwargs):
     """
     use to find local files
     """
-    return f"{date.strftime('%Y-%m-%dT%H:%M:%SZ')}_{shortname}_lt1-45_crop.npy"
+    return f"{date.strftime('%Y-%m-%dT%H:%M:%SZ')}_{var_file_name}_lt1-45_crop.npy"
 
 
-def get_weight(level: int, kind: str):
-    if kind == "hPa":
-        return 1 + (level) / (90)
-    elif kind == "m":
-        return 2
+def get_weight(level: float, level_type: str) -> float:
+    if level_type == "isobaricInHpa":
+        return 1.0 + (level) / (90)
+    elif level_type == "heightAboveGround":
+        return 2.0
+    elif level_type == "surface":
+        return 1.0
     else:
-        raise Exception(f"unknown kind:{kind}, must be hPa or m right now")
+        raise Exception(f"unknown level_type:{level_type}")
 
 
 @dataclass(slots=True)
@@ -105,9 +108,11 @@ class Grid:
         filename = SCRATCH_PATH / LATLON_FNAME
         with open(filename, "rb") as f:
             lonlat = np.load(f)
-        return lonlat[
-            0, self.subgrid[0] : self.subgrid[1], self.subgrid[2] : self.subgrid[3]
-        ]
+        return np.transpose(
+            lonlat[
+                1, self.subgrid[0] : self.subgrid[1], self.subgrid[2] : self.subgrid[3]
+            ]
+        )
 
     @cached_property
     def lon(self) -> np.array:
@@ -115,7 +120,7 @@ class Grid:
         with open(filename, "rb") as f:
             lonlat = np.load(f)
         return lonlat[
-            1, self.subgrid[0] : self.subgrid[1], self.subgrid[2] : self.subgrid[3]
+            0, self.subgrid[0] : self.subgrid[1], self.subgrid[2] : self.subgrid[3]
         ]
 
     @cached_property
@@ -171,13 +176,11 @@ class Grid:
 class Param:
     name: str
     shortname: str
-    levels: Tuple[int]
+    levels: Tuple[float, ...]
     grid: Grid  # Parameter grid.
-    # It is not necessarly the same as the model grid.
-    # Function which can return the filenames.
-    # It should accept member and date as argument (as well as term).
-    fnamer: Callable[[], [str]]  # VSCode doesn't like this, is it ok ?
-    level_type: str = "hPa"  # To be read in nc file ?
+    fnamer: Callable[[], [str]]
+    filenameref: str  # string to retrieve the datafile corresponding to Param
+    level_type: str = "isobaricInHpa"  # To be read in nc file ?
     kind: Literal["input", "output", "input_output"] = "input_output"
     unit: str = "FakeUnit"  # To be read in nc FIle  ?
     ndims: int = 2
@@ -185,7 +188,7 @@ class Param:
     @property
     def number(self) -> int:
         """
-        Get the number of parameters.
+        Get the number of levels for the given parameters.
         """
         return len(self.levels)
 
@@ -213,17 +216,14 @@ class Param:
         """
         Return the filename.
         """
-
-        return SCRATCH_PATH / self.fnamer(date=date, shortname=self.shortname)
+        return SCRATCH_PATH / self.fnamer(date=date, var_file_name=self.filenameref)
 
     def load_data(self, date: dt.datetime, term: List, member: int) -> np.array:
         """
         date : Date of file.
         term : Position of leadtimes in file.
         """
-        data_array = np.memmap(
-            self.filename(date=date), dtype="float32", mode="r", shape=DATA_SHAPE
-        )
+        data_array = np.load(self.filename(date=date), mmap_mode="r")
 
         return data_array[
             self.grid.subgrid[0] : self.grid.subgrid[1],
@@ -272,34 +272,6 @@ class Sample:
     def __post_init__(self):
         self.terms = self.input_terms + self.output_terms
 
-    @property
-    def hours_of_day(self) -> np.array:
-        """
-        Hour of the day.
-        For output terms only. This is a float.
-        """
-        hours = []
-        for term in self.output_terms:
-            date_tmp = self.date + dt.timedelta(hours=float(term))
-            hours.append(date_tmp.hour + date_tmp.minute / 60)
-        return np.asarray(hours)
-
-    @property
-    def seconds_from_start_of_year(self) -> np.array:
-        """
-        Second from the start of the year.
-        For output terms only
-        """
-        start_of_year = dt.datetime(self.date.year, 1, 1)
-        return np.asarray(
-            [
-                (
-                    self.date + dt.timedelta(hours=float(term)) - start_of_year
-                ).total_seconds()
-                for term in self.output_terms
-            ]
-        )
-
     def is_valid(self, param_list: List) -> bool:
         """
         Check that all the files necessary for this samples exists.
@@ -309,7 +281,6 @@ class Sample:
         Returns:
             Boolean:  Whether the sample exist or not
         """
-
         for param in param_list:
 
             if not param.exist(self.date):
@@ -402,7 +373,6 @@ class PoesyDataset(DatasetABC, Dataset):
         for date in self.period.date_list:
             for member in self.settings.members:
                 for sample in range(0, sample_by_date):
-
                     input_terms = terms[
                         sample
                         * self.settings.num_total_steps : sample
@@ -428,8 +398,8 @@ class PoesyDataset(DatasetABC, Dataset):
 
                         samples.append(samp)
                         number += 1
-        print("All samples are now defined")
 
+        print("All samples are now defined")
         return samples
 
     @cached_property
@@ -447,36 +417,14 @@ class PoesyDataset(DatasetABC, Dataset):
             )
         ]
 
-    def get_year_hour_forcing(self, sample: Sample):
-        """
-        Get the forcing term dependent of the sample time
-        """
-        hour_angle = (
-            torch.Tensor(sample.hours_of_day) / 12
-        ) * torch.pi  # (sample_len,)
-        year_angle = (
-            (torch.Tensor(sample.seconds_from_start_of_year) / SECONDS_IN_YEAR)
-            * 2
-            * torch.pi
-        )  # (sample_len,)
-        datetime_forcing = torch.stack(
-            (
-                torch.sin(hour_angle),
-                torch.cos(hour_angle),
-                torch.sin(year_angle),
-                torch.cos(year_angle),
-            ),
-            dim=1,
-        )  # (N_t, 4)
-        datetime_forcing = (datetime_forcing + 1) / 2  # Rescale to [0,1]
-        return datetime_forcing
-
     @cached_property
     def forcing_dim(self) -> int:
         """
         Return the number of forcings.
         """
         res = 4  # For date
+        res += 1  # For solar forcing
+
         for param in self.params:
             if param.kind == "input":
                 res += param.number
@@ -520,6 +468,7 @@ class PoesyDataset(DatasetABC, Dataset):
             std = np.asarray([self.stats[name]["std"] for name in names])
 
         array = param.load_data(date, terms, member)
+
         # Extend dimension to match 3D (level dimension)
         if len(array.shape) != 4:
             array = np.expand_dims(array, axis=-1)
@@ -540,7 +489,15 @@ class PoesyDataset(DatasetABC, Dataset):
         sample = self.sample_list[index]
 
         # Datetime Forcing
-        datetime_forcing = self.get_year_hour_forcing(sample).type(torch.float32)
+        datetime_forcing = get_year_hour_forcing(sample.date, sample.output_terms).type(
+            torch.float32
+        )
+
+        # Solar forcing, dim : [num_pred_steps, Lat, Lon, feature = 1]
+        solar_forcing = generate_toa_radiation_forcing(
+            self.grid.lat, self.grid.lon, sample.date, sample.output_terms
+        ).type(torch.float32)
+
         lforcings = [
             NamedTensor(
                 feature_names=[
@@ -558,7 +515,15 @@ class PoesyDataset(DatasetABC, Dataset):
                 tensor=datetime_forcing[:, 2:],
                 names=["timestep", "features"],
             ),
+            NamedTensor(
+                feature_names=[
+                    "toa_radiation",
+                ],
+                tensor=solar_forcing,
+                names=["timestep", "lat", "lon", "features"],
+            ),
         ]
+
         linputs = []
         loutputs = []
 
@@ -569,13 +534,13 @@ class PoesyDataset(DatasetABC, Dataset):
                 "names": ["timestep", "lat", "lon", "features"],
             }
             try:
-
                 if param.kind == "input_output":
                     # Search data for date sample.date and terms sample.terms
                     tensor = self.get_param_tensor(
                         param,
                         sample.date,
                         terms=sample.terms,
+                        member=sample.member,
                         inference_steps=self.settings.num_inference_pred_steps,
                     )
                     state_kwargs["names"][0] = "timestep"
@@ -626,17 +591,14 @@ class PoesyDataset(DatasetABC, Dataset):
             for var in data["var"]:
                 vard = data["var"][var]
                 # Change grid definition
-                if "level" in vard:
-                    level_type = "hPa"
-                else:
-                    level_type = "m"
                 param = Param(
                     name=var,
                     shortname=vard.pop("shortname", "t2m"),
-                    levels=vard.pop("level", [0]),
+                    levels=vard.pop("level", [2]),
                     grid=grid,
-                    level_type=level_type,
                     fnamer=poesy_forecast_namer,
+                    filenameref=vard.pop("filename", "t2m"),
+                    level_type=vard.pop("typeOfLevel", "heightAboveGround"),
                     **vard,
                 )
                 param_list.append(param)
@@ -688,6 +650,7 @@ class PoesyDataset(DatasetABC, Dataset):
             shuffle=self.shuffle,
             prefetch_factor=tl_settings.prefetch_factor,
             collate_fn=collate_fn,
+            pin_memory=tl_settings.pin_memory,
         )
 
     @property
@@ -859,10 +822,8 @@ class InferPoesyDataset(PoesyDataset):
         )
 
         sample_by_date = len(terms) // self.settings.num_total_steps
-
         samples = []
         number = 0
-
         for date in self.period.date_list:
             for member in self.settings.members:
                 for sample in range(0, sample_by_date):
@@ -888,10 +849,10 @@ class InferPoesyDataset(PoesyDataset):
                     )
 
                     if samp.is_valid(self.params):
-
                         samples.append(samp)
                         number += 1
         print("All samples are now defined")
+        print(samples)
 
         return samples
 
@@ -912,6 +873,7 @@ class InferPoesyDataset(PoesyDataset):
             conf = json.load(fp)
             if config_override is not None:
                 conf = merge_dicts(conf, config_override)
+                print(conf["periods"]["test"])
 
         grid = Grid(**conf["grid"])
         param_list = []
@@ -921,26 +883,19 @@ class InferPoesyDataset(PoesyDataset):
             term = conf["dataset"][data_source]["term"]
             for var in data["var"]:
                 vard = data["var"][var]
-                # Change grid definition
-                if "level" in vard:
-                    level_type = "hPa"
-                else:
-                    level_type = "m"
                 param = Param(
                     name=var,
                     shortname=vard.pop("shortname", "t2m"),
-                    levels=vard.pop("level", [0]),
+                    levels=vard.pop("level", [2]),
                     grid=grid,
-                    level_type=level_type,
                     fnamer=poesy_forecast_namer,
+                    filenameref=vard.pop("filename", "t2m"),
+                    level_type=vard.pop("typeOfLevel", "heightAboveGround"),
                     **vard,
                 )
                 param_list.append(param)
-        inference_period = (
-            Period(**conf["periods"]["test"], name="infer")
-            if not config_override
-            else Period(**config_override["periods"]["test"], name="infer")
-        )
+        inference_period = Period(**conf["periods"]["test"], name="infer")
+
         ds = InferPoesyDataset(
             grid,
             inference_period,
@@ -975,7 +930,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # PoesyDataset.prepare(args.path_config)
+    PoesyDataset.prepare(args.path_config)
 
     print("Dataset info : ")
     train_ds, _, _ = PoesyDataset.from_json(args.path_config, 2, 3, 3)

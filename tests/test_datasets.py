@@ -1,10 +1,14 @@
 """
 Unit tests for datasets and NamedTensor.
 """
+import datetime
+
+import numpy as np
 import pytest
 import torch
 
 from py4cast.datasets.base import Item, NamedTensor, collate_fn
+from py4cast.forcingutils import generate_toa_radiation_forcing, get_year_hour_forcing
 
 
 def test_named_tensor():
@@ -52,6 +56,7 @@ def test_named_tensor():
         torch.rand(3, 256, 256, 50),
         names=["batch", "lat", "lon", "levels"],
         feature_names=[f"feature_{i}" for i in range(50)],
+        feature_dim_name="levels",
     )
     assert nt4.spatial_dim_idx == [1, 2]
     with pytest.raises(ValueError):
@@ -62,9 +67,18 @@ def test_named_tensor():
         torch.rand(3, 256, 50),
         names=["batch", "lat", "lon"],
         feature_names=[f"feature_{i}" for i in range(50)],
+        feature_dim_name="lon",
     )
     with pytest.raises(ValueError):
         nt | nt5
+
+    with pytest.raises(ValueError):
+        # missing feature_dim_name
+        nt = NamedTensor(
+            torch.rand(3, 256, 256, 50),
+            names=["batch", "lat", "lon", "tutu"],
+            feature_names=[f"feature_{i}" for i in range(49)],
+        )
 
     # missing feature with __getitem__ lookup => ValueError
     with pytest.raises(ValueError):
@@ -132,6 +146,72 @@ def test_named_tensor():
         f"v_{i}" for i in range(10)
     ] + [f"u_{i}" for i in range(10)]
     assert nt_cat.names == ["batch", "lat", "lon", "features"]
+
+    # test unsqueeze_
+    nt_cat.unsqueeze_("new_dim", 1)
+    assert nt_cat.tensor.shape == (3, 1, 256, 256, 30)
+    assert nt_cat.names == ["batch", "new_dim", "lat", "lon", "features"]
+
+    # test squeeze_
+    nt_cat.squeeze_("new_dim")
+    assert nt_cat.tensor.shape == (3, 256, 256, 30)
+    assert nt_cat.names == ["batch", "lat", "lon", "features"]
+
+    # test select_dim along the features dim
+    t = nt_cat.select_dim("features", 0)
+    assert t.shape == (3, 256, 256)
+
+    # test select_dim along the lat dim
+    t = nt_cat.select_dim("lat", 128)
+    assert t.shape == (3, 256, 30)
+
+    # test index_select_dim
+    t = nt_cat.index_select_dim("features", [0, 1, 2])
+    assert t.shape == (3, 256, 256, 3)
+
+    # test select_dim when returning NamedTensor
+    with pytest.raises(ValueError):
+        t = nt_cat.select_dim("features", 0, bare_tensor=False)
+    t = nt_cat.select_dim("lon", 0, bare_tensor=False)
+    assert t.tensor.shape == (3, 256, 30)
+    assert t.feature_names == nt_cat.feature_names
+    assert t.names == ["batch", "lat", "features"]
+
+    # test index_select_dim when returning NamedTensor
+    t = nt_cat.index_select_dim("features", [0, 1, 2], bare_tensor=False)
+    assert t.tensor.shape == (3, 256, 256, 3)
+    assert t.feature_names == nt_cat.feature_names[:3]
+    assert t.names == ["batch", "lat", "lon", "features"]
+
+    # test dim_size
+    assert nt_cat.dim_size("features") == 30
+
+    # test dim_index
+    assert nt_cat.dim_index("features") == 3
+
+    # test NamedTensor with features in second dim
+    nt = NamedTensor(
+        torch.rand(3, 50, 256, 256),
+        names=["batch", "features", "lat", "lon"],
+        feature_names=[f"feature_{i}" for i in range(50)],
+    )
+    assert nt.dim_size("features") == 50
+    assert nt.dim_index("features") == 1
+    # test __getitem__ with feature name
+    f = nt["feature_0"]
+    assert f.shape == (3, 1, 256, 256)
+
+    # test feature_dim_name is preserved by select_dim and index_select_dim
+    nt = NamedTensor(
+        torch.rand(3, 50, 256, 256),
+        names=["batch", "feats", "lat", "lon"],
+        feature_names=[f"feature_{i}" for i in range(50)],
+        feature_dim_name="feats",
+    )
+    t = nt.select_dim("batch", 0, bare_tensor=False)
+    assert t.feature_dim_name == "feats"
+    t = nt.index_select_dim("feats", [0, 1, 2], bare_tensor=False)
+    assert t.feature_dim_name == "feats"
 
 
 def test_item():
@@ -215,3 +295,60 @@ def test_item():
         )
 
         item = Item(inputs=inputs, outputs=outputs, forcing=forcing)
+
+
+def test_date_forcing():
+    """
+    Testing the date forcing.
+    """
+    date = datetime.datetime(year=2023, month=12, day=31, hour=23)
+    relativ_terms = [1, 2, 3]
+
+    nb_terms = len(relativ_terms)
+    nb_forcing = 4
+
+    forcing = get_year_hour_forcing(date, relativ_terms)
+
+    # Check the dimension of the output
+    assert forcing.shape == torch.Size((nb_terms, nb_forcing))
+    # Check the result of the specific value : midnight of the new year 2024
+    assert torch.allclose(forcing[0], torch.tensor([0.5, 1, 0.5, 1]))
+
+
+def test_solar_forcing():
+    """
+    Testing the solar forcing.
+    """
+    # Testing the specific value of the exercice 1.6.2.a of Solar Engineering of Thermal Processes,
+    # Photovoltaics and Wind 5th ed.
+
+    # Input data of the exercice
+    lat = torch.tensor(43)
+    lon = torch.tensor(-89)
+    relativ_terms = [0]
+    # solar_date = datetime.datetime(year=2023, month=2, day=13, hour=9, minute = 30), add 5h56 to convert into utc hour
+    utc_date = datetime.datetime(year=2023, month=2, day=13, hour=15, minute=26)
+    E0 = 1366
+
+    # Tolerance to imprecision
+    error_margin = 0.01
+
+    # Solution
+    cos_solution = np.cos(np.radians(66.5))
+    solution = E0 * cos_solution
+
+    forcing = generate_toa_radiation_forcing(lat, lon, utc_date, relativ_terms)
+
+    # Testing if result is far from solution
+    assert np.abs(forcing - solution) < error_margin
+
+    # Testing the output shape
+    lat = torch.rand(16, 16)
+    lon = torch.rand(16, 16)
+    utc_date = datetime.datetime(year=2023, month=5, day=20, hour=13)
+    relativ_terms = [1, 2, 3]
+
+    forcing = generate_toa_radiation_forcing(lat, lon, utc_date, relativ_terms)
+
+    # Test the shape
+    assert forcing.shape == torch.Size((3, 16, 16, 1))

@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel
+FROM pytorch/pytorch:2.1.2-cuda11.8-cudnn8-devel
 
 ARG INJECT_MF_CERT
 
@@ -28,7 +28,7 @@ COPY requirements.txt /app/requirements.txt
 RUN set -eux && pip install --default-timeout=100 -r /app/requirements.txt
 COPY requirements_lint.txt /app/requirements_lint.txt
 RUN pip install --default-timeout=100 -r /app/requirements_lint.txt
-
+RUN MAX_JOBS=8 pip install flash-attn --no-build-isolation
 ARG USERNAME
 ARG GROUPNAME
 ARG USER_UID
@@ -50,6 +50,7 @@ RUN set -eux && pip install pyg-lib==0.4.0 torch-scatter==2.1.2 torch-sparse==0.
 
 WORKDIR $HOME_DIR
 RUN curl -fsSL https://code-server.dev/install.sh | sh
+
 
 
 

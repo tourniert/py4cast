@@ -1,11 +1,9 @@
 import datetime as dt
 import json
 import time
-import traceback
-import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import Dict, List, Literal, Tuple, Union
 
@@ -18,21 +16,7 @@ import torch
 import tqdm
 import typer
 import xarray as xr
-from joblib import Parallel, delayed
 from skimage.transform import resize
-
-# Cyeccodes is a Cython module from Météo-France to read grib faster than xarray+cfgrib
-try:
-    from cyeccodes import nested_dd_iterator
-    from cyeccodes.eccodes import get_multi_messages_from_file
-
-    use_cyeccodes = True
-except ImportError:
-    warnings.warn(
-        f"Could not import Cyeccodes, switching to xarray+cfgrib. {traceback.format_exc()}"
-    )
-    use_cyeccodes = False
-
 from torch.utils.data import DataLoader, Dataset
 
 from py4cast.datasets.base import (
@@ -50,8 +34,8 @@ from py4cast.datasets.titan.settings import (
     METADATA,
     SCRATCH_PATH,
 )
+from py4cast.forcingutils import generate_toa_radiation_forcing, get_year_hour_forcing
 from py4cast.plots import DomainInfo
-from py4cast.settings import CACHE_DIR
 from py4cast.utils import merge_dicts
 
 app = typer.Typer()
@@ -62,48 +46,6 @@ def get_weight_per_lvl(level: int, kind: Literal["hPa", "m"]):
         return 1 + (level) / (1000)
     else:
         return 2
-
-
-def read_grib_with_cyeccodes(
-    path_grib: Path, name=None, level=None
-) -> Dict[str, Dict[int, np.ndarray]]:
-    if name or level:
-        include_filters = {
-            k: v for k, v in [("cfVarName", name), ("level", [level])] if v is not None
-        }
-    else:
-        include_filters = None
-    _, results = get_multi_messages_from_file(
-        path_grib,
-        storage_keys=("cfVarName", "level"),
-        include_filters=include_filters,
-        metadata_keys=("missingValue", "Ni", "Nj"),
-        include_latlon=False,
-    )
-
-    grib_dict = {}
-    for metakey, result in nested_dd_iterator(results):
-        arr = result["values"]
-        grid = (result["metadata"]["Nj"], result["metadata"]["Ni"])
-        mv = result["metadata"]["missingValue"]
-        arr = np.reshape(arr, grid)
-        arr = np.where(arr == mv, np.nan, arr)
-        name, level = metakey.split("-")
-        level = int(level)
-        grib_dict[name] = {}
-        grib_dict[name][level] = arr
-    return grib_dict
-
-
-def read_grib_with_xarray(path_grib: Path) -> Dict[str, Dict[int, np.ndarray]]:
-    ds = xr.load_dataset(path_grib, engine="cfgrib", backend_kwargs={"indexpath": ""})
-    grib_dict = {}
-    for name in ds.data_vars:
-        level_name = ds[name].attrs["GRIB_typeOfLevel"]
-        level = int(ds[level_name].values)
-        grib_dict[name] = {}
-        grib_dict[name][level] = ds[name].values
-    return grib_dict
 
 
 #############################################################
@@ -229,6 +171,11 @@ class Grid:
 #############################################################
 
 
+@lru_cache(maxsize=50)
+def read_grib(path_grib: Path) -> xr.Dataset:
+    return xr.load_dataset(path_grib, engine="cfgrib", backend_kwargs={"indexpath": ""})
+
+
 @dataclass(slots=True)
 class Param:
     name: str
@@ -243,6 +190,7 @@ class Param:
     native_grid: str = field(init=False)
     grib_name: str = field(init=False)
     grib_param: str = field(init=False)
+    npy_path: Path = None
 
     def __post_init__(self):
         param_info = METADATA["WEATHER_PARAMS"][self.name]
@@ -255,9 +203,9 @@ class Param:
             self.level_type = "hPa"
         self.long_name = param_info["long_name"]
         self.native_grid = param_info["grid"]
-        if self.native_grid not in ["PAAROME_1S100", "PAAROME_1S40"]:
+        if self.native_grid not in ["PAAROME_1S100", "PAAROME_1S40", "PA_01D"]:
             raise NotImplementedError(
-                "Parameter native grid must be in ['PAAROME_1S100', 'PAAROME_1S40']"
+                "Parameter native grid must be in ['PAAROME_1S100', 'PAAROME_1S40', 'PA_01D']"
             )
 
     @property
@@ -287,24 +235,19 @@ class Param:
         return [self.unit]
 
     def get_filepath(
-        self, date: dt.datetime, file_format: Literal["npy", "grib", "dataset"]
+        self, date: dt.datetime, file_format: Literal["npy", "grib"]
     ) -> Path:
         """
         Returns the path of the file containing the parameter data.
-        - in npy format, data is grouped per weather param.
         - in grib format, data is grouped by level type.
-        - in "dataset" format, data is saved as npy and each 2D array is saved as one
-        file to optimize IO during training."""
-        folder = SCRATCH_PATH / file_format / date.strftime(FORMATSTR)
-        filename = f"{self.name}_{self.level}{self.level_type.lower()}.npy"
-        if file_format == "npy":
-            return folder / filename
-        elif file_format == "grib":
+        - in npy format, data is saved as npy, rescaled to the wanted grid, and each
+        2D array is saved as one file to optimize IO during training."""
+        if file_format == "grib":
+            folder = SCRATCH_PATH / "grib" / date.strftime(FORMATSTR)
             return folder / self.grib_name
         else:
-            str_subdomain = "-".join([str(i) for i in self.grid.subdomain])
-            dataset_path = SCRATCH_PATH / f"dataset_{self.grid.name}_{str_subdomain}"
-            return dataset_path / date.strftime(FORMATSTR) / filename
+            filename = f"{self.name}_{self.level}{self.level_type.lower()}.npy"
+            return self.npy_path / date.strftime(FORMATSTR) / filename
 
     def fit_to_grid(self, arr: np.ndarray) -> np.ndarray:
         if self.grid.name == self.native_grid:
@@ -312,42 +255,48 @@ class Param:
         anti_aliasing = self.grid.name == "PAAROME_1S40"  # True if downsampling
         return resize(arr, self.grid.full_size, anti_aliasing=anti_aliasing)
 
-    def load_data_npy(self, date: dt.datetime) -> np.ndarray:
-        arr = np.load(self.get_filepath(date, "npy"))
-        return arr
-
     def load_data_grib(self, date: dt.datetime) -> np.ndarray:
         path_grib = self.get_filepath(date, "grib")
-        if use_cyeccodes:
-            param_dict = read_grib_with_cyeccodes(
-                path_grib, name=self.grib_param, level=self.level
-            )[self.grib_param]
+        ds = read_grib(path_grib)
+        level_type = ds[self.grib_param].attrs["GRIB_typeOfLevel"]
+        if level_type != "isobaricInhPa":  # Only one level
+            arr = ds[self.grib_param].values
         else:
-            param_dict = read_grib_with_xarray(path_grib)[self.grib_param]
-        arr = param_dict[self.level]
+            arr = ds[self.grib_param].sel(isobaricInhPa=self.level).values
         return arr
 
     def load_data(
-        self, date: dt.datetime, file_format: Literal["npy", "grib", "dataset"] = "grib"
+        self, date: dt.datetime, file_format: Literal["npy", "grib"] = "grib"
     ):
-        if file_format in ["npy", "grib"]:
-            if file_format == "npy":
-                arr = self.load_data_npy(date)
-            else:
-                arr = self.load_data_grib(date)
+        if file_format == "grib":
+            arr = self.load_data_grib(date)
             arr = self.fit_to_grid(arr)
             subdomain = self.grid.subdomain
             arr = arr[subdomain[0] : subdomain[1], subdomain[2] : subdomain[3]]
-
-            return arr[::-1]  # invert latitude  # TODO : WTF ? plots tensorboard ?
+            return arr[::-1]  # invert latitude
         else:
             return np.load(self.get_filepath(date, file_format))
 
-    def exist(
-        self, date: dt.datetime, file_format: Literal["npy", "grib", "dataset"] = "grib"
-    ):
+    def exist(self, date: dt.datetime, file_format: Literal["npy", "grib"] = "grib"):
         filepath = self.get_filepath(date, file_format)
         return filepath.exists()
+
+
+def process_sample_dataset(date: dt.datetime, params: List[Param]):
+    """Saves each 2D parameter data of the given date as one NPY file."""
+    for param in params:
+        dest_file = param.get_filepath(date, "npy")
+        dest_file.parent.mkdir(exist_ok=True)
+        if not dest_file.exists():
+            try:
+                arr = param.load_data(date, "grib")
+                np.save(dest_file, arr)
+            except Exception as e:
+                print(e)
+                print(
+                    f"WARNING: Could not load grib data {param.name} {param.level} {date}. Skipping sample."
+                )
+                break
 
 
 #############################################################
@@ -361,7 +310,7 @@ class TitanSettings:
     num_pred_steps: int  # Number of output timesteps
     step_duration: float  # duration in hour
     standardize: bool = True
-    file_format: Literal["npy", "grib", "dataset"] = "grib"
+    file_format: Literal["npy", "grib"] = "grib"
 
 
 #############################################################
@@ -390,19 +339,6 @@ class Sample:
     def __repr__(self):
         return f"Date T0 {self.date}, terms {self.terms}"
 
-    @property
-    def hours_of_day(self) -> np.array:
-        """Hour of the day for each step. This is a float."""
-        hours = [date.hour + date.minute / 60 for date in self.dates]
-        return np.asarray(hours)
-
-    @property
-    def seconds_from_start_of_year(self) -> np.array:
-        """Second from the start of the year for each step."""
-        start_of_year = dt.datetime(self.date_t0.year, 1, 1)
-        seconds = [(date - start_of_year).total_seconds() for date in self.dates]
-        return np.asarray(seconds)
-
     def is_valid(self) -> bool:
         """Check that all the files necessary for this sample exist.
 
@@ -416,30 +352,6 @@ class Sample:
                 if not param.exist(date, self.settings.file_format):
                     return False
         return True
-
-    def get_year_hour_forcing(self):
-        """Get the forcing term dependent of the sample time"""
-        hour_angle = (torch.Tensor(self.hours_of_day) / 12) * torch.pi  # (sample_len)
-        seconds_from_start_year = torch.Tensor(self.seconds_from_start_of_year)
-        # Keep only pred steps for forcing
-        hour_angle = hour_angle[-self.settings.num_pred_steps :]
-        seconds_from_start_year = seconds_from_start_year[
-            -self.settings.num_pred_steps :
-        ]
-        days_in_year = 366 if self.date_t0.year % 4 == 0 else 365
-        seconds_in_year = days_in_year * 24 * 60 * 60
-        year_angle = (seconds_from_start_year / seconds_in_year) * 2 * torch.pi
-        datetime_forcing = torch.stack(
-            (
-                torch.sin(hour_angle),
-                torch.cos(hour_angle),
-                torch.sin(year_angle),
-                torch.cos(year_angle),
-            ),
-            dim=1,
-        )  # (sample_len, 4)
-        datetime_forcing = (datetime_forcing + 1) / 2  # Rescale to [0,1]
-        return datetime_forcing
 
     def get_param_tensor(
         self, param: Param, dates: List[dt.datetime], no_standardize: bool = False
@@ -499,10 +411,19 @@ class Sample:
 
         time_forcing = NamedTensor(  # doy : day_of_year
             feature_names=["cos_hour", "sin_hour", "cos_doy", "sin_doy"],
-            tensor=self.get_year_hour_forcing().type(torch.float32),
+            tensor=get_year_hour_forcing(self.date_t0, self.terms).type(torch.float32),
             names=["timestep", "features"],
         )
+        solar_forcing = NamedTensor(
+            feature_names=["toa_radiation"],
+            tensor=generate_toa_radiation_forcing(
+                self.grid.lat, self.grid.lon, self.date_t0, self.terms
+            ).type(torch.float32),
+            names=["timestep", "lat", "lon", "features"],
+        )
         lforcings.append(time_forcing)
+        lforcings.append(solar_forcing)
+
         for forcing in lforcings:
             forcing.unsqueeze_and_expand_from_(linputs[0])
         return Item(
@@ -543,7 +464,7 @@ class Sample:
             for j, param in enumerate(dict_params[level]):
                 pname = param.parameter_short_names[0]
                 tensor = ntensor[pname][index_tensor, :, :, 0]
-                arr = tensor.numpy()[::-1]  # invert latitude # TODO WTF tensorboard ?
+                arr = tensor.numpy()[::-1]  # invert latitude
                 vmin, vmax = self.stats[pname]["min"], self.stats[pname]["max"]
                 img = axs[i, j].imshow(
                     arr, vmin=vmin, vmax=vmax, extent=self.grid.grid_limits
@@ -582,12 +503,39 @@ class Sample:
 #############################################################
 
 
+def get_dataset_path(name: str, grid: Grid):
+    str_subdomain = "-".join([str(i) for i in grid.subdomain])
+    subdataset_name = f"{name}_{grid.name}_{str_subdomain}"
+    return SCRATCH_PATH / "subdatasets" / subdataset_name
+
+
+def get_param_list(conf: dict, grid: Grid, dataset_path: Path) -> List[Param]:
+    param_list = []
+    for name, values in conf["params"].items():
+        for lvl in values["levels"]:
+            param = Param(
+                name=name,
+                level=lvl,
+                kind=values["kind"],
+                grid=grid,
+                npy_path=dataset_path / "data",
+            )
+            param_list.append(param)
+    return param_list
+
+
 class TitanDataset(DatasetABC, Dataset):
     # Si on doit travailler avec plusieurs grilles, on fera un super dataset qui contient
     # plusieurs datasets chacun sur une seule grille
     def __init__(
-        self, grid: Grid, period: Period, params: List[Param], settings: TitanSettings
+        self,
+        name: str,
+        grid: Grid,
+        period: Period,
+        params: List[Param],
+        settings: TitanSettings,
     ):
+        self.name = name
         self.grid = grid
         if grid.name not in ["PAAROME_1S100", "PAAROME_1S40"]:
             raise NotImplementedError(
@@ -596,13 +544,12 @@ class TitanDataset(DatasetABC, Dataset):
         self.period = period
         self.params = params
         self.settings = settings
-        self._cache_dir = CACHE_DIR / "datasets" / str(self)
         self.shuffle = self.period.name == "train"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         n_input, n_pred = self.settings.num_input_steps, self.settings.num_pred_steps
         filename = f"valid_samples_{self.period.name}_{n_input}_{n_pred}.txt"
-        self.valid_samples_file = self._cache_dir / filename
+        self.valid_samples_file = self.cache_dir / filename
 
     @cached_property
     def dataset_info(self) -> DatasetInfo:
@@ -644,16 +591,20 @@ class TitanDataset(DatasetABC, Dataset):
         print("Start creating samples...")
         stats = self.stats if self.settings.standardize else None
         if self.valid_samples_file.exists():
+            print(f"Retrieving valid samples from file {self.valid_samples_file}")
             with open(self.valid_samples_file, "r") as f:
                 dates_str = [line[:-1] for line in f.readlines()]
                 dateformat = "%Y-%m-%d_%Hh%M"
                 dates = [dt.datetime.strptime(ds, dateformat) for ds in dates_str]
+                dates = list(set(dates).intersection(set(self.period.date_list)))
                 samples = [
                     Sample(date, self.settings, self.params, stats, self.grid)
                     for date in dates
-                    if date in set(self.period.date_list)
                 ]
         else:
+            print(
+                f"Valid samples file {self.valid_samples_file} does not exist. Computing samples list..."
+            )
             samples = []
             for date in tqdm.tqdm(self.period.date_list):
                 sample = Sample(date, self.settings, self.params, stats, self.grid)
@@ -682,6 +633,7 @@ class TitanDataset(DatasetABC, Dataset):
     def forcing_dim(self) -> int:
         """Return the number of forcings."""
         res = 4  # For date (hour and year)
+        res += 1  # For solar forcing
         for param in self.params:
             if param.kind == "input":
                 res += param.number
@@ -697,46 +649,37 @@ class TitanDataset(DatasetABC, Dataset):
         return res
 
     def __getitem__(self, index: int) -> Item:
-
-        # TODO: build a single NamedTensor with all the inputs and outputs in one shot.
         sample = self.sample_list[index]
         item = sample.load()
         return item
 
     @classmethod
-    def get_param_list(cls, conf: dict, grid: Grid) -> List[Param]:
-        param_list = []
-        for name, values in conf["params"].items():
-            for lvl in values["levels"]:
-                param = Param(name=name, level=lvl, kind=values["kind"], grid=grid)
-                param_list.append(param)
-        return param_list
-
-    @classmethod
     def from_dict(
         cls,
+        name: str,
         conf: dict,
         num_input_steps: int,
         num_pred_steps_train: int,
         num_pred_steps_val_test: int,
     ) -> Tuple["TitanDataset", "TitanDataset", "TitanDataset"]:
         grid = Grid(**conf["grid"])
-        param_list = cls.get_param_list(conf, grid)
+        dataset_path = get_dataset_path(name, grid)
+        param_list = get_param_list(conf, grid, dataset_path)
 
         train_settings = TitanSettings(
             num_input_steps, num_pred_steps_train, **conf["settings"]
         )
         train_period = Period(**conf["periods"]["train"], name="train")
-        train_ds = TitanDataset(grid, train_period, param_list, train_settings)
+        train_ds = TitanDataset(name, grid, train_period, param_list, train_settings)
 
         valid_settings = TitanSettings(
             num_input_steps, num_pred_steps_val_test, **conf["settings"]
         )
         valid_period = Period(**conf["periods"]["valid"], name="valid")
-        valid_ds = TitanDataset(grid, valid_period, param_list, valid_settings)
+        valid_ds = TitanDataset(name, grid, valid_period, param_list, valid_settings)
 
         test_period = Period(**conf["periods"]["test"], name="test")
-        test_ds = TitanDataset(grid, test_period, param_list, valid_settings)
+        test_ds = TitanDataset(name, grid, test_period, param_list, valid_settings)
         return train_ds, valid_ds, test_ds
 
     @classmethod
@@ -753,7 +696,11 @@ class TitanDataset(DatasetABC, Dataset):
             if config_override is not None:
                 conf = merge_dicts(conf, config_override)
         return cls.from_dict(
-            conf, num_input_steps, num_pred_steps_train, num_pred_steps_val_test
+            fname.stem,
+            conf,
+            num_input_steps,
+            num_pred_steps_train,
+            num_pred_steps_val_test,
         )
 
     def __str__(self) -> str:
@@ -769,6 +716,7 @@ class TitanDataset(DatasetABC, Dataset):
             shuffle=self.shuffle,
             prefetch_factor=tl_settings.prefetch_factor,
             collate_fn=collate_fn,
+            pin_memory=tl_settings.pin_memory,
         )
 
     @property
@@ -832,7 +780,7 @@ class TitanDataset(DatasetABC, Dataset):
 
     @property
     def cache_dir(self) -> Path:
-        return self._cache_dir
+        return get_dataset_path(self.name, self.grid)
 
     @cached_property
     def domain_info(self) -> DomainInfo:
@@ -841,99 +789,82 @@ class TitanDataset(DatasetABC, Dataset):
             grid_limits=self.grid.grid_limits, projection=self.grid.projection
         )
 
-    @classmethod
-    def prepare(
-        cls,
-        path_config: Path,
-        num_input_steps: int,
-        num_pred_steps_train: int,
-        num_pred_steps_val_test: int,
-    ):
-        print("--> Preparing Titan Dataset...")
-
-        print("Load train dataset configuration...")
-        with open(path_config, "r") as fp:
-            conf = json.load(fp)
-
-        print("Computing stats on each parameter...")
-        conf["settings"]["standardize"] = False
-        train_ds, valid_ds, test_ds = TitanDataset.from_dict(
-            conf, num_input_steps, num_pred_steps_train, num_pred_steps_val_test
-        )
-        train_ds.write_list_valid_samples()
-        valid_ds.write_list_valid_samples()
-        test_ds.write_list_valid_samples()
-        train_ds.compute_parameters_stats()
-
-        print("Computing time stats on each parameters, between 2 timesteps...")
-        conf["settings"]["standardize"] = True
-        train_ds, valid_ds, test_ds = TitanDataset.from_dict(
-            conf, num_input_steps, num_pred_steps_train, num_pred_steps_val_test
-        )
-        train_ds.compute_time_step_stats()
-
-
-# TODO :
-# - adapt everywhere that 1 param = 1 lvl
-# - readme commandes typer
-
 
 @app.command()
 def prepare(
     path_config: Path = DEFAULT_CONFIG,
     num_input_steps: int = 1,
     num_pred_steps_train: int = 1,
-    num_pred_steps_val_test: int = 3,
+    num_pred_steps_val_test: int = 1,
+    convert_grib2npy: bool = False,
+    compute_stats: bool = True,
+    write_valid_samples_list: bool = True,
 ):
-    """Prepares Titan by computing statistics on all weather parameters."""
-    TitanDataset.prepare(
-        path_config, num_input_steps, num_pred_steps_train, num_pred_steps_val_test
-    )
+    """Prepares Titan dataset for training.
+    This command will:
+        - create all needed folders
+        - convert gribs to npy and rescale data to the wanted grid
+        - establish a list of valid samples for each set
+        - computes statistics on all weather parameters."""
+    print("--> Preparing Titan Dataset...")
 
-
-def save_sample_dataset(
-    date_folder: str, dest: Path, params: List[Param], fformat: str
-):
-    """Saves each 2D parameter data of the given date as one NPY file."""
-    date = dt.datetime.strptime(date_folder, "%Y-%m-%d_%Hh%M")
-    (dest / date_folder).mkdir(exist_ok=True)
-    for param in params:
-        filename = param.get_filepath(date, "npy").name
-        dest_file = dest / date_folder / filename
-        if not dest_file.exists():
-            try:
-                arr = param.load_data(date, fformat)
-                np.save(dest_file, arr)
-            except FileNotFoundError:
-                print(f"WARNING: Could not load data {param.name} {date}. Skipping.")
-
-
-@app.command()
-def rescale(
-    path_config: Path = DEFAULT_CONFIG, num_workers: int = 30, src_format: str = "npy"
-):
-    """Prepares Titan files by rescaling and cropping fields in advance."""
+    print("Load dataset configuration...")
     with open(path_config, "r") as fp:
         conf = json.load(fp)
-    str_subdomain = "-".join([str(i) for i in conf["grid"]["subdomain"]])
-    dest_path = SCRATCH_PATH / f"dataset_{conf['grid']['name']}_{str_subdomain}"
-    dest_path.mkdir(exist_ok=True)
-    src_path = SCRATCH_PATH / src_format
-    print(f"Preparing {dest_path.name}...")
-    print(f"Source data: {src_path}")
 
-    grid = Grid(**conf["grid"])
-    param_list = TitanDataset.get_param_list(conf, grid)
-
-    date_folders = [path.name for path in sorted(list(src_path.glob("*")))]
-    # We use "threads" to avoid _pickle.PicklingError: Could not pickle the task to send it to the workers
-    # see https://stackoverflow.com/questions/56884020/
-    # spacy-with-joblib-library-generates-pickle-picklingerror-could-not-pickle-the
-    Parallel(n_jobs=num_workers, prefer="threads")(
-        delayed(save_sample_dataset)(fld, dest_path, param_list, src_format)
-        for fld in tqdm.tqdm(date_folders)
+    print("Creating folders...")
+    train_ds, valid_ds, test_ds = TitanDataset.from_dict(
+        path_config.stem,
+        conf,
+        num_input_steps,
+        num_pred_steps_train,
+        num_pred_steps_val_test,
     )
-    print(f"Dataset saved in {dest_path}")
+    train_ds.cache_dir.mkdir(exist_ok=True)
+    data_dir = train_ds.cache_dir / "data"
+    data_dir.mkdir(exist_ok=True)
+    print(f"Dataset will be saved in {train_ds.cache_dir}")
+
+    if convert_grib2npy:
+        print("Converting gribs to npy...")
+        param_list = get_param_list(conf, train_ds.grid, train_ds.cache_dir)
+        sum_dates = (
+            list(train_ds.period.date_list)
+            + list(valid_ds.period.date_list)
+            + list(test_ds.period.date_list)
+        )
+        dates = sorted(list(set(sum_dates)))
+        for date in tqdm.tqdm(dates):
+            process_sample_dataset(date, param_list)
+        print("Done!")
+
+    conf["settings"]["standardize"] = False
+    train_ds, valid_ds, test_ds = TitanDataset.from_dict(
+        path_config.stem,
+        conf,
+        num_input_steps,
+        num_pred_steps_train,
+        num_pred_steps_val_test,
+    )
+    if compute_stats:
+        print("Computing stats on each parameter...")
+        train_ds.compute_parameters_stats()
+    if write_valid_samples_list:
+        train_ds.write_list_valid_samples()
+        valid_ds.write_list_valid_samples()
+        test_ds.write_list_valid_samples()
+
+    if compute_stats:
+        print("Computing time stats on each parameters, between 2 timesteps...")
+        conf["settings"]["standardize"] = True
+        train_ds, valid_ds, test_ds = TitanDataset.from_dict(
+            path_config.stem,
+            conf,
+            num_input_steps,
+            num_pred_steps_train,
+            num_pred_steps_val_test,
+        )
+        train_ds.compute_time_step_stats()
 
 
 @app.command()
@@ -943,8 +874,7 @@ def describe(path_config: Path = DEFAULT_CONFIG):
     train_ds.dataset_info.summary()
     print("Len dataset : ", len(train_ds))
     print("First Item description :")
-    data_iter = iter(train_ds.torch_dataloader())
-    print(next(data_iter))
+    print(train_ds[0])
 
 
 @app.command()
@@ -967,12 +897,12 @@ def speedtest(path_config: Path = DEFAULT_CONFIG, n_iter: int = 5):
     print("Dataset file_format: ", train_ds.settings.file_format)
     print("Speed test:")
     start_time = time.time()
-    for i in tqdm.trange(n_iter, desc="Loading samples"):
-        _ = next(data_iter)
+    for _ in tqdm.trange(n_iter, desc="Loading samples"):
+        next(data_iter)
     delta = time.time() - start_time
     print("Elapsed time : ", delta)
     speed = n_iter / delta
-    print(f"Loading speed: {round(speed, 3)} sample(s)/sec")
+    print(f"Loading speed: {round(speed, 3)} batch(s)/sec")
 
 
 if __name__ == "__main__":

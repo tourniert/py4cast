@@ -98,6 +98,8 @@ When working at Météo-France, you can use either runai + Docker or Conda/Micro
 
 See the [runai repository](https://git.meteo.fr/dsm-labia/monorepo4ai) for installation instructions.
 
+For HPC, see the related doc (doc/installMF.md) to get the right installation settings.
+
 ### Install with conda
 
 You can install a conda environment, including `py4cast` in editable mode, using
@@ -337,17 +339,23 @@ options:
   --date DATE
                         Date of the sample to infer on. Format:YYYYMMDDHH
   --dataset DATASET
-                        Name of the dataset config file to use
+                        Name of the dataset to use (typically the same as has been used for training)
+  --dataset_conf DATASET_CONF
+                        Name of the dataset config file (json, to change e.g dates, leadtimes, etc)
   --infer_steps INFER_STEPS
                         Number of auto-regressive steps/prediction steps during the inference
-
+   --precision PRECISION
+                        floating point precision for the inference (default: 32)
+   --grib BOOL
+                        Whether the outputs should be saved as grib, needs saving conf.
+   --saving_conf SAVING_CONF
+                        Name of the config file for write settings (json)
 ```
 
 A simple example of inference is shown below:
 
 ```bash
- runai exec_gpu python bin/inference.py --model_path /scratch/shared/py4cast/logs/camp0/poesy/halfunet/sezn_run_dev_9/last.ckpt --date 2021061621 --dataset poesy_infer --infer_steps 2
-
+ runai exec_gpu python bin/inference.py --model_path /scratch/shared/py4cast/logs/camp0/poesy/halfunet/sezn_run_dev_30 --date 2021061621 --dataset poesy_infer --infer_steps 2 --grib
 ```
 
 ### Making animated plots comparing multiple models

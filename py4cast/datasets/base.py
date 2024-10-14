@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, fields
 from functools import cached_property
 from itertools import chain
 from pathlib import Path
-from typing import Dict, List, Literal, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Tuple, Union
 
 import einops
 import numpy as np
@@ -19,7 +19,9 @@ from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import collate_tensor_fn
 from tqdm import tqdm
 
-from py4cast.plots import DomainInfo
+if TYPE_CHECKING:
+    from py4cast.plots import DomainInfo
+
 from py4cast.utils import RegisterFieldsMixin, torch_save
 
 
@@ -56,16 +58,20 @@ class NamedTensor(TensorWrapper):
     SPATIAL_DIM_NAMES = ("lat", "lon", "ngrid")
 
     def __init__(
-        self, tensor: torch.Tensor, names: List[str], feature_names: List[str]
+        self,
+        tensor: torch.Tensor,
+        names: List[str],
+        feature_names: List[str],
+        feature_dim_name: str = "features",
     ):
         if len(tensor.shape) != len(names):
             raise ValueError(
                 f"Number of names ({len(names)}) must match number of dimensions ({len(tensor.shape)})"
             )
-        if tensor.shape[-1] != len(feature_names):
+        if tensor.shape[names.index(feature_dim_name)] != len(feature_names):
             raise ValueError(
-                f"Number of feature names ({len(feature_names)}:{feature_names}) must match"
-                f"number of features ({tensor.shape[-1]})"
+                f"Number of feature names ({len(feature_names)}:{feature_names}) must match "
+                f"number of features ({tensor.shape[names.index(feature_dim_name)]}) in the supplied tensor"
             )
 
         super().__init__(tensor)
@@ -76,6 +82,7 @@ class NamedTensor(TensorWrapper):
             feature_name: idx for idx, feature_name in enumerate(feature_names)
         }
         self.feature_names = feature_names
+        self.feature_dim_name = feature_dim_name
 
     @property
     def ndims(self):
@@ -151,7 +158,7 @@ class NamedTensor(TensorWrapper):
             for nt in nts:
                 if feature_names & set(nt.feature_names):
                     raise ValueError(
-                        f"Feature names must be distinct between the named tensors to concat"
+                        f"Feature names must be distinct between the named tensors to concat\n"
                         f"Found duplicates: {feature_names & set(nt.feature_names)}"
                     )
                 feature_names |= set(nt.feature_names)
@@ -169,6 +176,12 @@ class NamedTensor(TensorWrapper):
                 list(chain.from_iterable(nt.feature_names for nt in nts)),
             )
 
+    def dim_index(self, dim_name: str) -> int:
+        """
+        Return the index of a dimension given its name.
+        """
+        return self.names.index(dim_name)
+
     def clone(self):
         return NamedTensor(
             tensor=deepcopy(self.tensor).to(self.tensor.device),
@@ -178,12 +191,13 @@ class NamedTensor(TensorWrapper):
 
     def __getitem__(self, feature_name: str) -> torch.Tensor:
         """
-        Get one feature of the tensor by name.
+        Get one feature from the features dimension of the tensor by name.
+        The returned tensor has the same number of dimensions as the original tensor.
         """
         try:
-            return self.tensor[..., self.feature_names_to_idx[feature_name]].unsqueeze(
-                -1
-            )
+            return self.select_dim(
+                self.feature_dim_name, self.feature_names_to_idx[feature_name]
+            ).unsqueeze(self.names.index(self.feature_dim_name))
         except KeyError:
             raise ValueError(
                 f"Feature {feature_name} not found in {self.feature_names}"
@@ -223,6 +237,73 @@ class NamedTensor(TensorWrapper):
         self.tensor = self.tensor.unflatten(dim, unflattened_size)
         self.names = self.names[:dim] + [*unflatten_dim_name] + self.names[dim + 1 :]
 
+    def squeeze_(self, dim_name: Union[List[str], str]):
+        """
+        Squeeze the underlying tensor along the dimension(s)
+        given its/their name(s).
+        """
+        if isinstance(dim_name, str):
+            dim_name = [dim_name]
+        dim_indices = [self.names.index(name) for name in dim_name]
+        self.tensor = torch.squeeze(self.tensor, dim=dim_indices)
+        for name in dim_name:
+            self.names.remove(name)
+
+    def unsqueeze_(self, dim_name: str, dim_index: int):
+        """ "
+        Insert a new dimension dim_name of size 1 at dim_index
+        """
+        self.tensor = torch.unsqueeze(self.tensor, dim_index)
+        self.names.insert(dim_index, dim_name)
+
+    def select_dim(
+        self, dim_name: str, index: int, bare_tensor: bool = True
+    ) -> Union["NamedTensor", torch.Tensor]:
+        """
+        Return the tensor indexed along the dimension dim_name
+        with the index index.
+        The given dimension is removed from the tensor.
+        See https://pytorch.org/docs/stable/generated/torch.select.html
+        """
+        if bare_tensor:
+            return self.tensor.select(self.names.index(dim_name), index)
+        else:
+            # if they try to select the features it will break as
+            # the feature dimension is not present anymore
+            return NamedTensor(
+                self.select_dim(dim_name, index, bare_tensor=True),
+                self.names[: self.names.index(dim_name)]
+                + self.names[self.names.index(dim_name) + 1 :],
+                self.feature_names,
+                feature_dim_name=self.feature_dim_name,
+            )
+
+    def index_select_dim(
+        self, dim_name: str, indices: torch.Tensor, bare_tensor: bool = True
+    ) -> Union["NamedTensor", torch.Tensor]:
+        """
+        Return the tensor indexed along the dimension dim_name
+        with the indices tensor.
+        The returned tensor has the same number of dimensions as the original tensor (input).
+        The dimth dimension has the same size as the length of index; other dimensions have
+        the same size as in the original tensor.
+        See https://pytorch.org/docs/stable/generated/torch.index_select.html
+        """
+        if bare_tensor:
+            return self.tensor.index_select(
+                self.names.index(dim_name),
+                torch.Tensor(indices).type(torch.int64).to(self.device),
+            )
+        else:
+            return NamedTensor(
+                self.index_select_dim(dim_name, indices, bare_tensor=True),
+                self.names,
+                self.feature_names
+                if dim_name != self.feature_dim_name
+                else [self.feature_names[i] for i in indices],
+                feature_dim_name=self.feature_dim_name,
+            )
+
     def dim_size(self, dim_name: str) -> int:
         """
         Return the size of a dimension given its name.
@@ -232,7 +313,7 @@ class NamedTensor(TensorWrapper):
         except ValueError as ve:
             raise ValueError(f"Dimension {dim_name} not found in {self.names}") from ve
 
-    @cached_property
+    @property
     def spatial_dim_idx(self) -> List[int]:
         """
         Return the indices of the spatial dimensions in the tensor.
@@ -293,6 +374,18 @@ class NamedTensor(TensorWrapper):
     def device(self) -> torch.device:
         return self.tensor.device
 
+    def pin_memory_(self):
+        """
+        'In place' operation to pin the underlying tensor to memory.
+        """
+        self.tensor = self.tensor.pin_memory()
+
+    def to_(self, *args, **kwargs):
+        """
+        'In place' operation to call torch's 'to' method on the underlying tensor.
+        """
+        self.tensor = self.tensor.to(*args, **kwargs)
+
 
 @dataclass(slots=True)
 class Item:
@@ -306,6 +399,41 @@ class Item:
     inputs: NamedTensor
     forcing: NamedTensor
     outputs: NamedTensor
+
+    def unsqueeze_(self, dim_name: str, dim_index: int):
+        """
+        Insert a new dimension dim_name at dim_index of size 1
+        """
+        self.inputs.unsqueeze_(dim_name, dim_index)
+        self.outputs.unsqueeze_(dim_name, dim_index)
+        self.forcing.unsqueeze_(dim_name, dim_index)
+
+    def squeeze_(self, dim_name: Union[List[str], str]):
+        """
+        Squeeze the underlying tensor along the dimension(s)
+        given its/their name(s).
+        """
+        self.inputs.squeeze_(dim_name)
+        self.outputs.squeeze_(dim_name)
+        self.forcing.squeeze_(dim_name)
+
+    def to_(self, *args, **kwargs):
+        """
+        'In place' operation to call torch's 'to' method on the underlying NamedTensors.
+        """
+        self.inputs.to_(*args, **kwargs)
+        self.outputs.to_(*args, **kwargs)
+        self.forcing.to_(*args, **kwargs)
+
+    def pin_memory(self):
+        """
+        Custom Item must implement this method to pin the underlying tensors to memory.
+        See https://pytorch.org/docs/stable/data.html#memory-pinning
+        """
+        self.inputs.pin_memory_()
+        self.forcing.pin_memory_()
+        self.outputs.pin_memory_()
+        return self
 
     def __post_init__(self):
         """
@@ -449,7 +577,10 @@ class Stats:
         return self.stats[shortname]
 
     def to_list(
-        self, aggregate: Literal["mean", "std", "min", "max"], shortnames: List[str]
+        self,
+        aggregate: Literal["mean", "std", "min", "max"],
+        shortnames: List[str],
+        dtype: torch.dtype = torch.float32,
     ) -> list:
         """
         Get a tensor with the stats inside.
@@ -465,7 +596,7 @@ class Stats:
         if len(shortnames) > 0:
             return torch.stack(
                 [self[name][aggregate] for name in shortnames], dim=0
-            ).type(torch.float32)
+            ).type(dtype)
         else:
             return []
 
@@ -479,7 +610,7 @@ class DatasetInfo:
     """
 
     name: str  # Name of the dataset
-    domain_info: DomainInfo  # Information used for plotting
+    domain_info: "DomainInfo"  # Information used for plotting
     units: Dict[str, str]  # d[shortname] = unit (str)
     weather_dim: int
     forcing_dim: int
@@ -605,10 +736,15 @@ class DatasetABC(ABC):
         """
         Compute mean and standard deviation for this dataset.
         """
-        means = []
-        squares = []
-        mins = []
-        maxs = []
+        random_inputs = next(iter(self.torch_dataloader())).inputs
+        n_features = len(random_inputs.feature_names)
+        sum_means = torch.zeros(n_features)
+        sum_squares = torch.zeros(n_features)
+        ndim_features = len(random_inputs.tensor.shape) - 1
+        flat_input = random_inputs.tensor.flatten(0, ndim_features - 1)  # (X, Features)
+        best_min = torch.min(flat_input, dim=0).values
+        best_max = torch.max(flat_input, dim=0).values
+        counter = 0
         print(
             "We are going to compute statistics on the dataset. This can take a while."
         )
@@ -618,7 +754,6 @@ class DatasetABC(ABC):
         for batch in tqdm(self.torch_dataloader(), desc="Computing stats"):
 
             # Here we assume that data are in 2 or 3 D
-
             inputs = batch.inputs.tensor
             outputs = batch.outputs.tensor
 
@@ -634,44 +769,51 @@ class DatasetABC(ABC):
                 1, 3
             )  # Flatten everybody to be (Batch, X, Features)
 
-            means.append(in_out.mean(dim=1))
-            squares.append((in_out**2).mean(dim=1))
-            maxi, _ = torch.max(in_out, 1)
-            mini, _ = torch.min(in_out, 1)
-            mins.append(mini)  # (N_batch, d_features,)
-            maxs.append(maxi)  # (N_batch, d_features,)
+            counter += in_out.shape[0]  # += batch size
 
-        mean = torch.mean(torch.cat(means, dim=0), dim=0)  # (d_features)
-        second_moment = torch.mean(torch.cat(squares, dim=0), dim=0)
+            sum_means += torch.sum(in_out.mean(dim=1), dim=0)  # (d_features)
+            sum_squares += torch.sum((in_out**2).mean(dim=1), dim=0)  # (d_features)
+
+            mini = torch.min(in_out, 1).values[0]
+            stack_mini = torch.stack([best_min, mini], dim=0)
+            best_min = torch.min(stack_mini, dim=0).values  # (d_features)
+
+            maxi = torch.max(in_out, 1).values[0]
+            stack_maxi = torch.stack([best_max, maxi], dim=0)
+            best_max = torch.max(stack_maxi, dim=0).values  # (d_features)
+
+        mean = sum_means / counter
+        second_moment = sum_squares / counter
         std = torch.sqrt(second_moment - mean**2)  # (d_features)
-        maxi, _ = torch.max(torch.cat(maxs, dim=0), dim=0)
-        mini, _ = torch.min(torch.cat(mins, dim=0), dim=0)
-
-        # Store in dictionnary
-        store_d = {}
 
         # Storing variable statistics
+        store_d = {}
         for i, name in enumerate(batch.inputs.feature_names):
             store_d[name] = {
                 "mean": mean[i],
                 "std": std[i],
-                "min": mini[i],
-                "max": maxi[i],
+                "min": best_min[i],
+                "max": best_max[i],
             }
-        torch_save(store_d, self.cache_dir / "parameters_stats.pt")
+        dest_file = self.cache_dir / "parameters_stats.pt"
+        torch_save(store_d, dest_file)
+        print(f"Parameters statistics saved in {dest_file}")
 
     def compute_time_step_stats(self):
-        diff_means = []
-        diff_squares = []
+        random_inputs = next(iter(self.torch_dataloader())).inputs
+        n_features = len(random_inputs.feature_names)
+        sum_means = torch.zeros(n_features)
+        sum_squares = torch.zeros(n_features)
+        counter = 0
         if not self.settings.standardize:
             print(
                 f"Your dataset {self} is not normalized. If you do not normalized your output it could be intended."
             )
             print("Otherwise consider standardizing your inputs.")
+
         for batch in tqdm(self.torch_dataloader()):
 
-            # Here we postpone that data are in 2 or 3 D
-
+            # Here we assume that data are in 2 or 3 D
             inputs = batch.inputs.tensor
             outputs = batch.outputs.tensor
 
@@ -688,13 +830,12 @@ class DatasetABC(ABC):
             )  # Substract information on time dimension
             diff = diff.flatten(1, 3)  # Flatten everybody to be (Batch, X, Features)
 
-            diff_means.append(diff.mean(dim=1))
-            diff_squares.append((diff**2).mean(dim=1))
+            counter += in_out.shape[0]  # += batch size
+            sum_means += torch.sum(diff.mean(dim=1), dim=0)  # (d_features)
+            sum_squares += torch.sum((diff**2).mean(dim=1), dim=0)  # (d_features)
 
-        # This should not work
-        # We should be aware that dataset shoul
-        diff_mean = torch.mean(torch.cat(diff_means, dim=0), dim=0)
-        diff_second_moment = torch.mean(torch.cat(diff_squares, dim=0), dim=0)
+        diff_mean = sum_means / counter
+        diff_second_moment = sum_squares / counter
         diff_std = torch.sqrt(diff_second_moment - diff_mean**2)  # (d_features)
         store_d = {}
 
@@ -704,7 +845,9 @@ class DatasetABC(ABC):
                 "mean": diff_mean[i],
                 "std": diff_std[i],
             }
+        dest_file = self.cache_dir / "diff_stats.pt"
         torch_save(store_d, self.cache_dir / "diff_stats.pt")
+        print(f"Parameters time diff stats saved in {dest_file}")
 
     @property
     def dataset_extra_statics(self) -> List[NamedTensor]:

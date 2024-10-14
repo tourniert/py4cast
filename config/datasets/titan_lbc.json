@@ -62,6 +62,26 @@
         "aro_z": {
             "levels": [250, 500, 700, 850],
             "kind": "input_output"
+        },
+        "arp_t": {
+            "levels": [250, 500, 700, 850],
+            "kind": "input"
+        },
+        "arp_u":{
+            "levels": [250, 500, 700, 850],
+            "kind": "input"
+        },
+        "arp_v":{
+            "levels": [250, 500, 700, 850],
+            "kind": "input"
+        },
+        "arp_z":{
+            "levels": [250, 500, 700, 850],
+            "kind": "input"
+        },
+        "arp_r":{
+            "levels": [250, 500, 700, 850],
+            "kind": "input"
         }
     }
 }

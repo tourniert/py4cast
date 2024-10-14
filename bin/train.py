@@ -13,7 +13,7 @@ from pathlib import Path
 import pytorch_lightning as pl
 import torch
 from lightning.pytorch.loggers import TensorBoardLogger
-from lightning.pytorch.profilers import PyTorchProfiler
+from lightning.pytorch.profilers import AdvancedProfiler, PyTorchProfiler
 from lightning_fabric.utilities import seed
 from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
@@ -56,7 +56,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--dataset_conf",
-    type=str,  # Union[str, None] # Union does not work from CLI.
+    type=Path,  # Union[str, None] # Union does not work from CLI.
     default=None,
     help="Configuration file for the dataset. If None, default configuration is used.",
 )
@@ -193,6 +193,20 @@ parser.add_argument(
     default="run",
     help="Name of the run.",
 )
+parser.add_argument(
+    "--pin_memory",
+    "-pm",
+    action=BooleanOptionalAction,
+    default=False,
+    help="Use pin_memory in dataloader",
+)
+parser.add_argument(
+    "--channels_last",
+    "-cl",
+    action=BooleanOptionalAction,
+    default=False,
+    help="Use torch's channel last",
+)
 
 args, other = parser.parse_known_args()
 username = getpass.getuser()
@@ -222,19 +236,19 @@ dl_settings = TorchDataloaderSettings(
     batch_size=args.batch_size,
     num_workers=args.num_workers,
     prefetch_factor=args.prefetch_factor,
+    pin_memory=args.pin_memory,
 )
 train_ds, val_ds, test_ds = datasets
 train_loader = train_ds.torch_dataloader(dl_settings)
 val_loader = val_ds.torch_dataloader(dl_settings)
 test_loader = test_ds.torch_dataloader(dl_settings)
 
-
 # Setup GPU usage + get len of loader for LR scheduler
 if torch.cuda.is_available():
     device_name = "cuda"
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    # torch.set_float32_matmul_precision("high") # Allows using Tensor Cores on A100s
+    torch.set_float32_matmul_precision("high")  # Allows using Tensor Cores on A100s
     len_loader = len(train_loader) // (torch.cuda.device_count() * nb_nodes)
 else:
     device_name = "cpu"
@@ -270,6 +284,9 @@ hp = ArLightningHyperParam(
     len_train_loader=len_loader,
     save_path=save_path,
     use_lr_scheduler=args.use_lr_scheduler,
+    precision=args.precision,
+    no_log=args.no_log,
+    channels_last=args.channels_last,
 )
 
 # Logger & checkpoint callback
@@ -298,17 +315,27 @@ else:
     )
     callback_list.append(checkpoint_callback)
     callback_list.append(LearningRateMonitor(logging_interval="step"))
-callback_list.append(EarlyStopping(monitor="val_mean_loss", mode="min", patience=50))
+    callback_list.append(
+        EarlyStopping(monitor="val_mean_loss", mode="min", patience=50)
+    )
 
 # Setup profiler
 if args.profiler == "pytorch":
     profiler = PyTorchProfiler(
         dirpath=ROOTDIR / f"logs/{args.model}/{args.dataset}",
-        filename=f"profile_{run_id}",
+        filename=f"torch_profile_{run_id}",
         export_to_chrome=True,
         profile_memory=True,
     )
     print("Initiate pytorchProfiler")
+elif args.profiler == "advanced":
+    profiler = AdvancedProfiler(
+        dirpath=ROOTDIR / f"logs/{args.model}/{args.dataset}",
+        filename=f"advanced_profile_{run_id}",
+        line_count_restriction=50,  # Display top 50 lines
+    )
+elif args.profiler == "simple":
+    profiler = args.profiler
 else:
     profiler = None
     print(f"No profiler set {args.profiler}")
