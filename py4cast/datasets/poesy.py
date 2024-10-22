@@ -224,7 +224,6 @@ class Param:
         term : Position of leadtimes in file.
         """
         data_array = np.load(self.filename(date=date), mmap_mode="r")
-
         return data_array[
             self.grid.subgrid[0] : self.grid.subgrid[1],
             self.grid.subgrid[2] : self.grid.subgrid[3],
@@ -261,7 +260,6 @@ class Sample:
     # Describe a sample
     # TODO consider members
     member: int
-    settings: PoesySettings
     date: dt.datetime
     input_terms: Tuple[float]
     output_terms: Tuple[float]
@@ -387,7 +385,6 @@ class PoesyDataset(DatasetABC, Dataset):
                         + self.settings.num_output_steps
                     ]
                     samp = Sample(
-                        settings=self.settings,
                         date=date,
                         member=member,
                         input_terms=input_terms,
@@ -579,8 +576,14 @@ class PoesyDataset(DatasetABC, Dataset):
         num_pred_steps_val_test: int,
         config_override: Union[Dict, None] = None,
     ) -> Tuple["PoesyDataset", "PoesyDataset", "PoesyDataset"]:
+        """
+        Return 3 PoesyDataset.
+        Override configuration file if needed.
+        """
         with open(fname, "r") as fp:
             conf = json.load(fp)
+            if config_override is not None:
+                conf = merge_dicts(conf, config_override)
 
         grid = Grid(**conf["grid"])
         param_list = []
@@ -645,7 +648,7 @@ class PoesyDataset(DatasetABC, Dataset):
     ) -> DataLoader:
         return DataLoader(
             self,
-            tl_settings.batch_size,
+            batch_size=tl_settings.batch_size,
             num_workers=tl_settings.num_workers,
             shuffle=self.shuffle,
             prefetch_factor=tl_settings.prefetch_factor,
@@ -810,7 +813,7 @@ class InferPoesyDataset(PoesyDataset):
     def sample_list(self):
         """
         Create a list of sample from information.
-        Outputs terms are computed from the number of prediction steps wanted by the user.
+        Outputs terms are computed from the number of prediction steps in argument.
         """
         print("Start forming samples")
         terms = list(
@@ -841,7 +844,6 @@ class InferPoesyDataset(PoesyDataset):
                     ]
 
                     samp = InferSample(
-                        settings=self.settings,
                         date=date,
                         member=member,
                         input_terms=input_terms,
@@ -852,7 +854,6 @@ class InferPoesyDataset(PoesyDataset):
                         samples.append(samp)
                         number += 1
         print("All samples are now defined")
-        print(samples)
 
         return samples
 
@@ -905,9 +906,10 @@ class InferPoesyDataset(PoesyDataset):
                 term=term,
                 num_input_steps=num_input_steps,
                 num_output_steps=0,
-                num_inference_pred_steps=config_override["num_inference_pred_steps"],
+                num_inference_pred_steps=conf["num_inference_pred_steps"],
             ),
         )
+
         return None, None, ds
 
 
